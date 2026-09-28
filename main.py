@@ -15,17 +15,18 @@ TELEGRAM_TOKEN = "8638954699:AAFuVLUKhi12SIm6iomuZ8fvyBgbLz37g2o"
 CHAT_ID = "7371069482"
 FINNHUB_API_KEY = "darfuk9r01qn6lvf6tdgdarfuk9r01qn6lvf6te0"
 
-# Tickers de tu portafolio del mercado global
+# Portafolio de acciones globales
 TICKERS = ["NVDA", "AVGO", "AMD", "ASML", "AMAT", "LRCX", "INTC", "CSCO", "KLAC"]
 
-# Hora de inicio del servidor para cálculo de Uptime
+# Registro de servidor y memoria de precios para volatilidad
 INICIO_SERVIDOR = datetime.now(pytz.timezone('America/Lima'))
+precios_anteriores = {}
 
 @app.route('/')
 def home():
     return "Servidor del Bot de Finanzas UNI en ejecución 24/7 🚀"
 
-# --- DIAGNÓSTICO: Ver el estado del bot desde el navegador ---
+# --- DIAGNÓSTICO: Estado del bot en tiempo real ---
 @app.route('/estado')
 def estado():
     tz_peru = pytz.timezone('America/Lima')
@@ -54,10 +55,10 @@ def estado():
 @app.route('/probar')
 def probar():
     reporte = obtener_reporte_completo()
-    enviar_telegram("🧪 *PRUEBA MANUAL MULTIFUENTE*\n\n" + reporte)
+    enviar_telegram("🧪 *PRUEBA MANUAL DE MERCADO CON SEÑALES*\n\n" + reporte)
     return "¡Reporte enviado a Telegram correctamente! 🚀"
 
-# --- WEBHOOK: Responder a comandos enviados desde Telegram ---
+# --- WEBHOOK: Comandos desde Telegram ---
 @app.route('/telegram', methods=['POST'])
 def webhook_telegram():
     data = request.get_json()
@@ -67,12 +68,12 @@ def webhook_telegram():
 
         if chat_id == CHAT_ID:
             if texto in ["/start", "/ayuda"]:
-                msg = "🤖 *Comandos del Bot de Finanzas*\n\n/ping - Verificar si el bot está vivo\n/reporte - Generar reporte completo\n/estado - Ver métricas del servidor"
+                msg = "🤖 *Comandos del Bot de Finanzas*\n\n/ping - Verificar estado\n/reporte - Reporte con señales de Compra/Venta\n/estado - Métricas del servidor"
                 enviar_telegram(msg)
             elif texto == "/ping":
-                enviar_telegram("🏓 *¡Pong!* El bot está funcionando correctamente desde Render.")
+                enviar_telegram("🏓 *¡Pong!* Servidor activo y monitoreando mercado.")
             elif texto == "/reporte":
-                enviar_telegram("📊 Generando reporte en tiempo real, aguarda un momento...")
+                enviar_telegram("📊 Generando análisis cuantitativo de mercado, aguarda...")
                 reporte = obtener_reporte_completo()
                 enviar_telegram(reporte)
             elif texto == "/estado":
@@ -97,7 +98,35 @@ def enviar_telegram(mensaje):
     except Exception as e:
         print(f"Error enviando mensaje a Telegram: {e}")
 
-# --- FUENTE 1: Finnhub API ---
+# --- INDICADOR TÉCNICO: CÁLCULO DE RSI (14 PERÍODOS) ---
+def calcular_rsi(hist, periodos=14):
+    try:
+        if len(hist) < periodos + 1:
+            return 50.0
+        delta = hist['Close'].diff()
+        ganancia = (delta.where(delta > 0, 0)).rolling(window=periodos).mean()
+        perdida = (-delta.where(delta < 0, 0)).rolling(window=periodos).mean()
+        rs = ganancia / perdida
+        rsi = 100 - (100 / (1 + rs))
+        val = rsi.iloc[-1]
+        return float(val) if not (val != val) else 50.0  # Evitar NaN
+    except Exception:
+        return 50.0
+
+# --- ALGORITMO DECISOR DE COMPRA / VENTA ---
+def evaluar_decision_inversion(upside, rsi):
+    if rsi >= 70 or (upside is not None and upside < -5):
+        return "🔴 *VENDER / TOMAR GANANCIAS* (Sobrecomprada)"
+    elif rsi <= 38 and (upside is None or upside >= 10):
+        return "🚀 *COMPRA FUERTE* (Acción en oferta / Sobrevendida)"
+    elif upside is not None and upside >= 15:
+        return "🟢 *COMPRAR* (Atractivo potencial según Wall Street)"
+    elif upside is not None and upside <= 0:
+        return "⚠️ *EVALUAR VENTA* (Alcanzó o superó precio objetivo)"
+    else:
+        return "⚖️ *MANTENER* (Rango neutral de mercado)"
+
+# --- FUENTES DE NOTICIAS ---
 def obtener_noticia_finnhub(ticker):
     if not FINNHUB_API_KEY or FINNHUB_API_KEY == "TU_FINNHUB_API_KEY_AQUI":
         return None
@@ -119,7 +148,6 @@ def obtener_noticia_finnhub(ticker):
         pass
     return None
 
-# --- FUENTE 2: Google News RSS ---
 def obtener_noticia_google_rss(ticker):
     try:
         url = f"https://news.google.com/rss/search?q={ticker}+stock+when:1d&hl=en-US&gl=US&ceid=US:en"
@@ -138,7 +166,6 @@ def obtener_noticia_google_rss(ticker):
         pass
     return None
 
-# --- FUENTE 3: Yahoo Finance News ---
 def obtener_noticia_yfinance(stock):
     try:
         news = stock.news
@@ -153,7 +180,6 @@ def obtener_noticia_yfinance(stock):
         pass
     return None
 
-# --- SISTEMA DE RESPALDO DE NOTICIAS MULTIFUENTE ---
 def obtener_noticia_multifuente(stock, ticker):
     noticia = obtener_noticia_finnhub(ticker)
     if noticia:
@@ -169,39 +195,72 @@ def obtener_noticia_multifuente(stock, ticker):
     
     return "📰 Sin noticias recientes disponibles."
 
+# --- GENERADOR DEL REPORTE COMPLETO CON DECISIONES ---
 def obtener_reporte_completo():
-    resumen = "🌐 *REPORTE MULTIFUENTE Y ANALISTAS - MERCADO GLOBAL*\n\n"
+    resumen = "🌐 *ANÁLISIS DE MERCADO Y DECISIONES DE INVERSIÓN*\n\n"
     
     for ticker in TICKERS:
         try:
             stock = yf.Ticker(ticker)
-            data = stock.history(period="1d")
+            hist = stock.history(period="1mo")
             info = stock.info
             
-            if not data.empty:
-                precio_actual = data['Close'].iloc[-1]
-                precio_apertura = data['Open'].iloc[0]
+            if not hist.empty:
+                precio_actual = hist['Close'].iloc[-1]
+                precio_apertura = hist['Open'].iloc[-1]
                 var_pct = ((precio_actual - precio_apertura) / precio_apertura) * 100
                 icono = "🟢" if var_pct >= 0 else "🔴"
                 
-                rec = info.get('recommendationKey', 'N/A').replace('_', ' ').title()
+                rsi = calcular_rsi(hist)
                 target_price = info.get('targetMeanPrice', None)
                 
+                upside = None
                 upside_str = ""
                 if target_price:
                     upside = ((target_price - precio_actual) / precio_actual) * 100
-                    upside_str = f" | Potencial: *{upside:+.1f}%* (Target: ${target_price:.2f})"
+                    upside_str = f" | Target: ${target_price:.2f} ({upside:+.1f}%)"
+
+                decision = evaluar_decision_inversion(upside, rsi)
 
                 resumen += f"{icono} *{ticker}*: ${precio_actual:.2f} ({var_pct:+.2f}%)\n"
-                resumen += f"   💡 *Consenso:* {rec}{upside_str}\n"
+                resumen += f"   📊 *RSI:* {rsi:.1f}{upside_str}\n"
+                resumen += f"   💡 *Decisión:* {decision}\n"
 
                 noticia = obtener_noticia_multifuente(stock, ticker)
                 resumen += f"   {noticia}\n\n"
         except Exception as e:
-            resumen += f"⚠️ *{ticker}*: Error al obtener datos ({e})\n\n"
+            resumen += f"⚠️ *{ticker}*: Error obteniendo datos ({e})\n\n"
             
     return resumen
 
+# --- VERIFICADOR DE VOLATILIDAD CADA 5 MINUTOS ---
+def verificar_volatilidad_mercado():
+    global precios_anteriores
+    for ticker in TICKERS:
+        try:
+            stock = yf.Ticker(ticker)
+            data = stock.history(period="1d", interval="5m")
+            if not data.empty:
+                precio_actual = data['Close'].iloc[-1]
+                
+                if ticker in precios_anteriores:
+                    precio_previo = precios_anteriores[ticker]
+                    var_5min = ((precio_actual - precio_previo) / precio_previo) * 100
+                    
+                    # Notificar solo si varía 1.5% o más en los últimos 5 minutos
+                    if abs(var_5min) >= 1.5:
+                        icono = "🚀" if var_5min > 0 else "💥"
+                        msg = f"{icono} *MOVIMIENTO BRUSCO EN 5 MINUTOS*\n\n"
+                        msg += f"Acción: *{ticker}*\n"
+                        msg += f"Precio Actual: *${precio_actual:.2f}*\n"
+                        msg += f"Variación: *{var_5min:+.2f}%*"
+                        enviar_telegram(msg)
+                
+                precios_anteriores[ticker] = precio_actual
+        except Exception as e:
+            print(f"Error comprobando volatilidad en {ticker}: {e}")
+
+# --- BUCLE PRINCIPAL DE MONITOREO ---
 def monitoreo_wall_street():
     tz_ny = pytz.timezone('America/New_York')
     tz_peru = pytz.timezone('America/Lima')
@@ -215,21 +274,25 @@ def monitoreo_wall_street():
         ahora_ny = datetime.now(tz_ny)
         ahora_peru = ahora_ny.astimezone(tz_peru)
         
-        dia_semana = ahora_ny.weekday()  # 0 = Lunes ... 5 = Sábado, 6 = Domingo
+        dia_semana = ahora_ny.weekday()
         hora_ny = ahora_ny.hour
         minuto_ny = ahora_ny.minute
         hora_peru = ahora_peru.hour
         minuto_peru = ahora_peru.minute
 
-        # Resetear banderas al cambiar de día en Perú
+        # Reiniciar banderas al cambiar el día
         if ahora_peru.day != ultimo_dia:
             alerta_apertura_enviada = False
             alerta_cierre_enviada = False
             reporte_fin_semana_enviado = False
             ultimo_dia = ahora_peru.day
 
-        # --- LUNES A VIERNES (Días de Mercado) ---
+        # --- DÍAS BURSÁTILES (Lunes a Viernes) ---
         if dia_semana < 5:
+            # Rueda activa: ejecutar análisis de volatilidad cada 5 min
+            if 9 <= hora_ny <= 16:
+                verificar_volatilidad_mercado()
+
             # 🔔 Alerta 5 min antes de la Apertura (9:25 AM NY)
             if hora_ny == 9 and minuto_ny == 25 and not alerta_apertura_enviada:
                 hora_peru_fmt = ahora_peru.strftime("%I:%M %p")
@@ -240,27 +303,26 @@ def monitoreo_wall_street():
             # 🔔 Alerta 5 min antes del Cierre (3:55 PM NY) + Reporte
             if hora_ny == 15 and minuto_ny == 55 and not alerta_cierre_enviada:
                 hora_peru_fmt = ahora_peru.strftime("%I:%M %p")
-                msg = f"🔔 *ALERTA MERCADO GLOBAL*\nWall Street cierra en 5 minutos.\n📍 *Hora en Perú:* {hora_peru_fmt}\nGenerando reporte multifuente de cierre..."
+                msg = f"🔔 *ALERTA MERCADO GLOBAL*\nWall Street cierra en 5 minutos.\n📍 *Hora en Perú:* {hora_peru_fmt}\nGenerando análisis y decisiones de inversión..."
                 enviar_telegram(msg)
                 
                 reporte = obtener_reporte_completo()
                 enviar_telegram(reporte)
                 alerta_cierre_enviada = True
 
-        # --- SÁBADO Y DOMINGO (Monitoreo de Noticias de Fin de Semana) ---
+        # --- FIN DE SEMANA (Sábado y Domingo) ---
         else:
-            # 📰 Envía un resumen de noticias a las 6:00 PM (Hora Perú)
             if hora_peru == 18 and minuto_peru == 0 and not reporte_fin_semana_enviado:
-                msg = "📰 *RESUMEN DE NOTICIAS DE FIN DE SEMANA*\nRevisando novedades de tu portafolio antes de la apertura del lunes..."
+                msg = "📰 *RESUMEN DE NOTICIAS DE FIN DE SEMANA*\nEvaluando novedades antes de la apertura del lunes..."
                 enviar_telegram(msg)
                 
                 reporte = obtener_reporte_completo()
                 enviar_telegram(reporte)
                 reporte_fin_semana_enviado = True
 
-        time.sleep(30)
+        time.sleep(300) # Revisa cada 5 minutos
 
-# Iniciar hilo de monitoreo en segundo plano
+# Iniciar hilo de monitoreo continuo
 hilo = threading.Thread(target=monitoreo_wall_street)
 hilo.daemon = True
 hilo.start()
