@@ -199,7 +199,7 @@ def obtener_noticia_finnhub(ticker):
         return None
     try:
         hoy = datetime.now().strftime('%Y-%m-%d')
-        hace_semana = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+        hace_semana = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={hace_semana}&to={hoy}&token={FINNHUB_API_KEY}"
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
