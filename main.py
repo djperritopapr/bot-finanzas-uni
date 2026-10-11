@@ -1,460 +1,481 @@
+"""Bot de seguimiento UNI. No ejecuta operaciones en MarketWatch.
+Python 3.11+. Configuración e instrucciones en LEEME.md.
+"""
 import os
-import re
+import json
+import math
 import time
+import secrets
+import logging
 import threading
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-import pytz
+from zoneinfo import ZoneInfo
+from functools import lru_cache
 import requests
 import yfinance as yf
-from flask import Flask, request
+import pandas_market_calendars as mcal
+from flask import Flask, request, jsonify
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('bot')
 app = Flask(__name__)
+NY = ZoneInfo('America/New_York')
+UTC = ZoneInfo('UTC')
+TICKERS = ['NVDA', 'AVGO', 'AMD', 'ASML', 'AMAT', 'LRCX', 'INTC', 'CSCO', 'KLAC']
+TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+CHAT = os.getenv('CHAT_ID', '')
+SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
+ADMIN = os.getenv('ADMIN_SECRET', '')
+REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL', '').rstrip('/')
+REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '')
+FINNHUB = os.getenv('FINNHUB_API_KEY', '')
+COMMISSION = float(os.getenv('COMMISSION', '20'))
+INITIAL_CASH = float(os.getenv('INITIAL_CASH', '10000'))
+PREFIX = os.getenv('REDIS_PREFIX', 'uni-finanzas')
+LOCK = threading.RLock()
+CAL = mcal.get_calendar('NASDAQ')
+START = datetime.now(UTC)
 
-# --- CONFIGURACIÓN DE CREDENCIALES ---
-TELEGRAM_TOKEN = "8638954699:AAFuVLUKhi12SIm6iomuZ8fvyBgbLz37g2o"
-CHAT_ID = "7371069482"
-FINNHUB_API_KEY = "darfuk9r01qn6lvf6tdgdarfuk9r01qn6lvf6te0"
 
-# Portafolio de acciones globales
-TICKERS = ["NVDA", "AVGO", "AMD", "ASML", "AMAT", "LRCX", "INTC", "CSCO", "KLAC"]
+def redis(*cmd):
+    if not REDIS_URL or not REDIS_TOKEN:
+        raise RuntimeError('Configura Upstash: no se guardarán datos en memoria temporal.')
+    r = requests.post(REDIS_URL, json=list(cmd),
+                      headers={'Authorization': 'Bearer ' + REDIS_TOKEN}, timeout=12)
+    r.raise_for_status()
+    body = r.json()
+    if body.get('error'):
+        raise RuntimeError('Error de almacenamiento Redis')
+    return body.get('result')
 
-INICIO_SERVIDOR = datetime.now(pytz.timezone('America/Lima'))
-precios_anteriores = {}
 
-# Memoria temporal para alertas personalizadas de precio
-alertas_personalizadas = []
+def key(name):
+    return PREFIX + ':' + name
 
-@app.route('/')
-def home():
-    return "Servidor del Bot de Finanzas UNI en ejecución 24/7 🚀"
 
-# --- DIAGNÓSTICO DEL SERVIDOR ---
-@app.route('/estado')
-def estado():
-    tz_peru = pytz.timezone('America/Lima')
-    tz_ny = pytz.timezone('America/New_York')
-    ahora_peru = datetime.now(tz_peru)
-    ahora_ny = datetime.now(tz_ny)
-    uptime = ahora_peru - INICIO_SERVIDOR
-    
-    horas, rem = divmod(int(uptime.total_seconds()), 3600)
-    minutos, segundos = divmod(rem, 60)
-    
-    num_alertas = len(alertas_personalizadas)
-    
-    html = f"""
-    <h2>🟢 Estado del Bot de Finanzas UNI</h2>
-    <ul>
-        <li><b>Estado:</b> Operativo 24/7</li>
-        <li><b>Tiempo Encendido:</b> {horas}h {minutos}m {segundos}s</li>
-        <li><b>Hora Oficial Perú:</b> {ahora_peru.strftime('%Y-%m-%d %I:%M:%S %p')}</li>
-        <li><b>Hora Wall Street (NY):</b> {ahora_ny.strftime('%Y-%m-%d %I:%M:%S %p')}</li>
-        <li><b>Finnhub API Key:</b> {"Configurada ✅" if FINNHUB_API_KEY else "No configurada ⚠️"}</li>
-        <li><b>Alertas de Precio Activas:</b> {num_alertas}</li>
-        <li><b>Acciones Monitoreadas ({len(TICKERS)}):</b> {', '.join(TICKERS)}</li>
-    </ul>
-    <p><a href="/probar">Click aquí para disparar prueba manual a Telegram</a></p>
-    """
-    return html
+def read_state():
+    raw = redis('GET', key('state'))
+    return json.loads(raw) if raw else {'trades': [], 'alerts': []}
 
-@app.route('/probar')
-def probar():
-    reporte = obtener_reporte_completo()
-    enviar_telegram("🧪 *PRUEBA MANUAL DE MERCADO CON SEÑALES*\n\n" + reporte)
-    return "¡Reporte enviado a Telegram correctamente! 🚀"
 
-# --- RECEPCIÓN DE WEBHOOKS DESDE TRADINGVIEW ---
-@app.route('/tradingview', methods=['POST'])
-def tradingview_webhook():
-    try:
-        mensaje_tv = request.get_data(as_text=True)
-        if mensaje_tv:
-            msg = f"📊 *ALERTA ENVIADA DESDE TRADINGVIEW*\n\n{mensaje_tv}"
-            enviar_telegram(msg)
-            return "Webhook Recibido", 200
-        return "Mensaje vacío", 400
-    except Exception as e:
-        return f"Error procesando Webhook: {e}", 500
+def write_state(state):
+    redis('SET', key('state'), json.dumps(state, allow_nan=False))
 
-# --- WEBHOOK INTERACTIVO DE TELEGRAM ---
-@app.route('/telegram', methods=['POST'])
-def webhook_telegram():
-    data = request.get_json()
-    if data and "message" in data:
-        chat_id = str(data["message"]["chat"]["id"])
-        texto = data["message"].get("text", "").strip()
 
-        if chat_id == CHAT_ID:
-            cmd = texto.lower().split()
-            
-            if texto.lower() in ["/start", "/ayuda"]:
-                msg = (
-                    "🤖 *Comandos del Bot de Finanzas*\n\n"
-                    "/reporte - Ver análisis, decisiones y resúmenes de noticias\n"
-                    "/alerta <TICKER> <PRECIO> - Crear alerta personalizada (Ej: `/alerta NVDA 215.50`)\n"
-                    "/alertas - Ver tus alertas activas\n"
-                    "/limpiar_alertas - Borrar todas tus alertas\n"
-                    "/ping - Verificar servidor\n"
-                    "/estado - Métricas del sistema"
-                )
-                enviar_telegram(msg)
-                
-            elif texto.lower() == "/ping":
-                enviar_telegram("🏓 *¡Pong!* Servidor activo y monitoreando el mercado.")
-                
-            elif texto.lower() == "/reporte":
-                enviar_telegram("📊 Generando análisis cuantitativo y resúmenes de noticias...")
-                reporte = obtener_reporte_completo()
-                enviar_telegram(reporte)
-                
-            elif texto.lower() == "/estado":
-                tz_peru = pytz.timezone('America/Lima')
-                ahora_peru = datetime.now(tz_peru)
-                uptime = ahora_peru - INICIO_SERVIDOR
-                msg = f"⚙️ *ESTADO DEL SERVIDOR*\n\n📍 *Hora Perú:* {ahora_peru.strftime('%I:%M:%S %p')}\n⏱️ *Tiempo activo:* {int(uptime.total_seconds() // 3600)} horas\n🎯 *Alertas personalizadas:* {len(alertas_personalizadas)}\n✅ *Monitoreo:* Activo"
-                enviar_telegram(msg)
+def send(text):
+    if not TOKEN or not CHAT:
+        raise RuntimeError('Configura TELEGRAM_TOKEN y CHAT_ID')
+    # Texto plano: titulares externos no pueden romper Markdown.
+    parts, current = [], ''
+    for line in text.splitlines(keepends=True):
+        while len(line) > 3500:
+            if current:
+                parts.append(current)
+                current = ''
+            parts.append(line[:3500])
+            line = line[3500:]
+        if len(current) + len(line) > 3500:
+            parts.append(current)
+            current = ''
+        current += line
+    if current:
+        parts.append(current)
+    for part in parts:
+        r = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',
+                          json={'chat_id': CHAT, 'text': part,
+                                'link_preview_options': {'is_disabled': True}}, timeout=15)
+        if r.status_code != 200 or not r.json().get('ok'):
+            raise RuntimeError(f'Telegram rechazó el mensaje (HTTP {r.status_code})')
 
-            elif cmd[0] == "/alerta" and len(cmd) == 3:
-                ticker = cmd[1].upper()
-                try:
-                    precio_target = float(cmd[2])
-                    if ticker in TICKERS:
-                        stock = yf.Ticker(ticker)
-                        hist = stock.history(period="1d")
-                        if not hist.empty:
-                            precio_actual = hist['Close'].iloc[-1]
-                            tipo = "suba" if precio_target > precio_actual else "caiga"
-                            alertas_personalizadas.append({
-                                "ticker": ticker,
-                                "precio": precio_target,
-                                "tipo": tipo
-                            })
-                            msg = f"🎯 *ALERTA CREADA*\n\nAcción: *{ticker}*\nPrecio Objetivo: *${precio_target:.2f}*\nCondición: Notificar cuando {tipo} a ${precio_target:.2f}\n(Precio Actual:${precio_actual:.2f})"
-                            enviar_telegram(msg)
-                    else:
-                        enviar_telegram(f"⚠️ El ticker *{ticker}* no está en tu portafolio. Acciones válidas: {', '.join(TICKERS)}")
-                except ValueError:
-                    enviar_telegram("⚠️ Formato incorrecto. Ejemplo de uso: `/alerta NVDA 215.50`")
 
-            elif texto.lower() == "/alertas":
-                if not alertas_personalizadas:
-                    enviar_telegram("📭 No tienes alertas personalizadas programadas.")
-                else:
-                    msg = "🎯 *MIS ALERTAS PERSONALIZADAS ACTIVAS*\n\n"
-                    for i, a in enumerate(alertas_personalizadas, 1):
-                        msg += f"{i}. *{a['ticker']}* → ${a['precio']:.2f} (Cuando {a['tipo']})\n"
-                    enviar_telegram(msg)
-
-            elif texto.lower() == "/limpiar_alertas":
-                alertas_personalizadas.clear()
-                enviar_telegram("🗑️ Se han eliminado todas tus alertas personalizadas.")
-
-    return "OK", 200
-
-def enviar_telegram(mensaje):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID, 
-        "text": mensaje, 
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Error enviando mensaje a Telegram: {e}")
-
-# --- CÁLCULO TÉCNICO DE RSI (14 DÍAS) ---
-def calcular_rsi(hist, periodos=14):
-    try:
-        if len(hist) < periodos + 1:
-            return 50.0
-        delta = hist['Close'].diff()
-        ganancia = (delta.where(delta > 0, 0)).rolling(window=periodos).mean()
-        perdida = (-delta.where(delta < 0, 0)).rolling(window=periodos).mean()
-        rs = ganancia / perdida
-        rsi = 100 - (100 / (1 + rs))
-        val = rsi.iloc[-1]
-        return float(val) if not (val != val) else 50.0
-    except Exception:
-        return 50.0
-
-# --- ALGORITMO DE DECISIONES ---
-def evaluar_decision_inversion(upside, rsi):
-    if rsi >= 70 or (upside is not None and upside < -5):
-        return "🔴 *VENDER / TOMAR GANANCIAS* (Sobrecomprada)"
-    elif rsi <= 38 and (upside is None or upside >= 10):
-        return "🚀 *COMPRA FUERTE* (Acción en oferta / Sobrevendida)"
-    elif upside is not None and upside >= 15:
-        return "🟢 *COMPRAR* (Atractivo potencial según Wall Street)"
-    elif upside is not None and upside <= 0:
-        return "⚠️ *EVALUAR VENTA* (Alcanzó o superó precio objetivo)"
-    else:
-        return "⚖ *MANTENER* (Rango neutral de mercado)"
-
-# --- EXTRACTORES DE RESÚMENES DE NOTICIAS ---
-def obtener_noticia_finnhub(ticker):
-    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "TU_FINNHUB_API_KEY_AQUI":
+@lru_cache(maxsize=32)
+def session(day):
+    s = CAL.schedule(start_date=day, end_date=day)
+    if s.empty:
         return None
-    try:
-        hoy = datetime.now().strftime('%Y-%m-%d')
-        hace_semana = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={hace_semana}&to={hoy}&token={FINNHUB_API_KEY}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                noticia = data[0]
-                titular = noticia.get('headline', '')
-                summary = noticia.get('summary', '')
-                fuente = noticia.get('source', 'Finnhub')
-                
-                texto = summary if summary else titular
-                resumen_corto = (texto[:130] + "...") if len(texto) > 130 else texto
-                if resumen_corto:
-                    return f"📰 *{fuente}:* {resumen_corto}"
-    except Exception:
-        pass
-    return None
+    return s.iloc[0]['market_open'].to_pydatetime(), s.iloc[0]['market_close'].to_pydatetime()
 
-def obtener_noticia_google_rss(ticker):
-    try:
-        url = f"https://news.google.com/rss/search?q={ticker}+stock+when:1d&hl=en-US&gl=US&ceid=US:en"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            root = ET.fromstring(resp.content)
-            item = root.find('.//item')
-            if item is not None:
-                titular = item.find('title').text if item.find('title') is not None else ""
-                desc = item.find('description').text if item.find('description') is not None else ""
-                fuente_elem = item.find('source')
-                fuente = fuente_elem.text if fuente_elem is not None else "Google News"
-                
-                # Limpiar cualquier etiqueta HTML en la descripción
-                desc_limpia = re.sub(r'<[^<]+?>', '', desc) if desc else titular
-                resumen_corto = (desc_limpia[:130] + "...") if len(desc_limpia) > 130 else desc_limpia
-                if resumen_corto:
-                    return f"📰 *{fuente}:* {resumen_corto}"
-    except Exception:
-        pass
-    return None
 
-def obtener_noticia_yfinance(stock):
-    try:
-        news = stock.news
-        if news and len(news) > 0:
-            top_news = news[0]
-            titular = top_news.get('title', '')
-            summary = top_news.get('summary', '')
-            fuente = top_news.get('publisher', 'Yahoo Finance')
-            
-            texto = summary if summary else titular
-            resumen_corto = (texto[:130] + "...") if len(texto) > 130 else texto
-            if resumen_corto:
-                return f"📰 *{fuente}:* {resumen_corto}"
-    except Exception:
-        pass
-    return None
+def is_open(now=None):
+    now = now or datetime.now(UTC)
+    bounds = session(now.astimezone(NY).date().isoformat())
+    return bool(bounds and bounds[0] <= now < bounds[1])
 
-def obtener_noticia_multifuente(stock, ticker):
-    noticia = obtener_noticia_finnhub(ticker)
-    if noticia:
-        return noticia
-    
-    noticia = obtener_noticia_google_rss(ticker)
-    if noticia:
-        return noticia
-    
-    noticia = obtener_noticia_yfinance(stock)
-    if noticia:
-        return noticia
-    
-    return "📰 Sin noticias recientes relevantes."
 
-# --- GENERADOR DEL REPORTE COMPLETO CON RESÚMENES ---
-def obtener_reporte_completo():
-    resumen = "🌐 *ANÁLISIS DE MERCADO Y DECISIONES DE INVERSIÓN*\n\n"
-    
-    for ticker in TICKERS:
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1mo")
-            info = stock.info
-            
-            if not hist.empty:
-                precio_actual = hist['Close'].iloc[-1]
-                precio_apertura = hist['Open'].iloc[-1]
-                var_pct = ((precio_actual - precio_apertura) / precio_apertura) * 100
-                icono = "🟢" if var_pct >= 0 else "🔴"
-                
-                rsi = calcular_rsi(hist)
-                target_price = info.get('targetMeanPrice', None)
-                
-                upside = None
-                upside_str = ""
-                if target_price:
-                    upside = ((target_price - precio_actual) / precio_actual) * 100
-                    upside_str = f" | Target: ${target_price:.2f} ({upside:+.1f}%)"
+def rsi_wilder(closes, period=14):
+    values = [float(v) for v in closes]
+    if len(values) < period + 1 or not all(math.isfinite(v) for v in values):
+        return None
+    changes = [b-a for a, b in zip(values, values[1:])]
+    gain = sum(max(v, 0) for v in changes[:period]) / period
+    loss = sum(max(-v, 0) for v in changes[:period]) / period
+    for v in changes[period:]:
+        gain = (gain*(period-1) + max(v, 0)) / period
+        loss = (loss*(period-1) + max(-v, 0)) / period
+    if loss == 0:
+        return 100.0 if gain else 50.0
+    return 100 - 100/(1 + gain/loss)
 
-                decision = evaluar_decision_inversion(upside, rsi)
-                tv_url = f"https://www.tradingview.com/symbols/{ticker}/"
 
-                resumen += f"{icono} *{ticker}*: ${precio_actual:.2f} ({var_pct:+.2f}%)\n"
-                resumen += f"   📊 *RSI:* {rsi:.1f}{upside_str}\n"
-                resumen += f"   💡 *Decisión:* {decision}\n"
-                resumen += f"   📈 [Gráfico en TradingView]({tv_url})\n"
+def market_data(ticker):
+    now = datetime.now(UTC)
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period='1y', interval='1d', auto_adjust=True)
+    if hist.empty:
+        raise ValueError('Sin precios disponibles')
+    price = float(hist['Close'].iloc[-1])
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError('Precio inválido')
+    today = now.astimezone(NY).date()
+    closed = hist.copy()
+    bounds = session(today.isoformat())
+    # No incluir una vela diaria que todavía se está formando.
+    if bounds and now < bounds[1]:
+        closed = closed[[stamp.date() < today for stamp in closed.index]]
+    previous = hist[[stamp.date() < hist.index[-1].date() for stamp in hist.index]]
+    change = (price / float(previous['Close'].iloc[-1]) - 1)*100 if not previous.empty else None
+    return {'ticker': ticker, 'price': price, 'change': change,
+            'rsi': rsi_wilder(closed['Close']), 'date': str(hist.index[-1].date()),
+            'rsi_date': str(closed.index[-1].date()) if not closed.empty else 'sin datos'}
 
-                noticia_resumen = obtener_noticia_multifuente(stock, ticker)
-                resumen += f"   {noticia_resumen}\n\n"
-        except Exception as e:
-            resumen += f"⚠️ *{ticker}*: Error obteniendo datos ({e})\n\n"
-            
-    return resumen
 
-# --- EVALUADOR DE ALERTAS PERSONALIZADAS ---
-def evaluar_alertas_personalizadas():
-    global alertas_personalizadas
-    alertas_a_borrar = []
-    
-    for alerta in alertas_personalizadas:
-        ticker = alerta["ticker"]
-        precio_target = alerta["precio"]
-        tipo = alerta["tipo"]
-        
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
-            if not hist.empty:
-                precio_actual = hist['Close'].iloc[-1]
-                disparar = False
-                
-                if tipo == "suba" and precio_actual >= precio_target:
-                    disparar = True
-                elif tipo == "caiga" and precio_actual <= precio_target:
-                    disparar = True
-                    
-                if disparar:
-                    tv_url = f"https://www.tradingview.com/symbols/{ticker}/"
-                    msg = f"🎯 *ALERTA DE PRECIO ALCANZADA*\n\n"
-                    msg += f"Acción: *{ticker}*\n"
-                    msg += f"Precio Objetivo: *${precio_target:.2f}*\n"
-                    msg += f"Precio Actual: *${precio_actual:.2f}*\n"
-                    msg += f"📈 [Abrir Gráfico en TradingView]({tv_url})"
-                    enviar_telegram(msg)
-                    alertas_a_borrar.append(alerta)
-        except Exception as e:
-            print(f"Error evaluando alerta personalizada de {ticker}: {e}")
-            
-    for a in alertas_a_borrar:
-        if a in alertas_personalizadas:
-            alertas_personalizadas.remove(a)
-
-# --- VERIFICADOR DE VOLATILIDAD EN TIEMPO REAL ---
-def verificar_volatilidad_mercado(hora_ny, minuto_ny):
-    global precios_anteriores
-    
-    # Ignorar primeros 10 minutos de apertura para evitar falsas alarmas por gaps
-    if hora_ny == 9 and minuto_ny < 40:
-        for ticker in TICKERS:
-            try:
-                stock = yf.Ticker(ticker)
-                data = stock.history(period="1d", interval="5m")
-                if not data.empty:
-                    precios_anteriores[ticker] = data['Close'].iloc[-1]
-            except Exception:
-                pass
-        return
-
-    for ticker in TICKERS:
-        try:
-            stock = yf.Ticker(ticker)
-            data = stock.history(period="1d", interval="5m")
-            if not data.empty:
-                precio_actual = data['Close'].iloc[-1]
-                
-                if ticker in precios_anteriores:
-                    precio_previo = precios_anteriores[ticker]
-                    var_5min = ((precio_actual - precio_previo) / precio_previo) * 100
-                    
-                    if abs(var_5min) >= 1.5:
-                        icono = "🚀" if var_5min > 0 else "💥"
-                        tv_url = f"https://www.tradingview.com/symbols/{ticker}/"
-                        msg = f"{icono} *MOVIMIENTO BRUSCO EN 5 MINUTOS*\n\n"
-                        msg += f"Acción: *{ticker}*\n"
-                        msg += f"Precio Actual: *${precio_actual:.2f}*\n"
-                        msg += f"Variación: *{var_5min:+.2f}%\n"
-                        msg += f"📈 [Ver en TradingView]({tv_url})"
-                        enviar_telegram(msg)
-                
-                precios_anteriores[ticker] = precio_actual
-        except Exception as e:
-            print(f"Error comprobando volatilidad en {ticker}: {e}")
-
-# --- BUCLE DE MONITOREO CONTINUO ---
-def monitoreo_wall_street():
-    tz_ny = pytz.timezone('America/New_York')
-    tz_peru = pytz.timezone('America/Lima')
-    
-    alerta_apertura_enviada = False
-    alerta_cierre_enviada = False
-    reporte_fin_semana_enviado = False
-    ultimo_dia = -1
-
-    while True:
-        ahora_ny = datetime.now(tz_ny)
-        ahora_peru = ahora_ny.astimezone(tz_peru)
-        
-        dia_semana = ahora_ny.weekday()
-        hora_ny = ahora_ny.hour
-        minuto_ny = ahora_ny.minute
-        hora_peru = ahora_peru.hour
-        minuto_peru = ahora_peru.minute
-
-        # Evaluar alertas personalizadas continuamente
-        evaluar_alertas_personalizadas()
-
-        if ahora_peru.day != ultimo_dia:
-            alerta_apertura_enviada = False
-            alerta_cierre_enviada = False
-            reporte_fin_semana_enviado = False
-            ultimo_dia = ahora_peru.day
-
-        # --- DÍAS BURSÁTILES (Lunes a Viernes) ---
-        if dia_semana < 5:
-            if (hora_ny == 9 and minuto_ny >= 30) or (10 <= hora_ny < 16):
-                verificar_volatilidad_mercado(hora_ny, minuto_ny)
-
-            if hora_ny == 9 and 25 <= minuto_ny <= 29 and not alerta_apertura_enviada:
-                hora_peru_fmt = ahora_peru.strftime("%I:%M %p")
-                msg = f"🔔 *ALERTA MERCADO GLOBAL*\nWall Street abre en 5 minutos.\n📍 *Hora en Perú:* {hora_peru_fmt}\n¡Prepara tus órdenes!"
-                enviar_telegram(msg)
-                alerta_apertura_enviada = True
-
-            if hora_ny == 15 and 55 <= minuto_ny <= 59 and not alerta_cierre_enviada:
-                hora_peru_fmt = ahora_peru.strftime("%I:%M %p")
-                msg = f"🔔 *ALERTA MERCADO GLOBAL*\nWall Street cierra en 5 minutos.\n📍 *Hora en Perú:* {hora_peru_fmt}\nGenerando reporte completo de decisiones y resúmenes..."
-                enviar_telegram(msg)
-                
-                reporte = obtener_reporte_completo()
-                enviar_telegram(reporte)
-                alerta_cierre_enviada = True
-
-        # --- FIN DE SEMANA ---
+def portfolio(state):
+    cash, realized, fees, positions = INITIAL_CASH, 0.0, 0.0, {}
+    for t in state['trades']:
+        p = positions.setdefault(t['ticker'], {'qty': 0, 'cost': 0.0})
+        q, price, fee = t['qty'], t['price'], t['fee']
+        fees += fee
+        if t['side'] == 'buy':
+            total = q*price + fee
+            cash -= total
+            p['qty'] += q
+            p['cost'] += total
         else:
-            if hora_peru == 18 and minuto_peru == 0 and not reporte_fin_semana_enviado:
-                msg = "📰 *RESUMEN DE NOTICIAS DE FIN DE SEMANA*\nEvaluando novedades antes de la apertura del lunes..."
-                enviar_telegram(msg)
-                
-                reporte = obtener_reporte_completo()
-                enviar_telegram(reporte)
-                reporte_fin_semana_enviado = True
+            basis = p['cost']/p['qty']*q
+            proceeds = q*price-fee
+            cash += proceeds
+            realized += proceeds-basis
+            p['qty'] -= q
+            p['cost'] -= basis
+    return cash, realized, fees, {t:p for t,p in positions.items() if p['qty']}
 
-        time.sleep(300) # Revisa cada 5 minutos
 
-hilo = threading.Thread(target=monitoreo_wall_street)
-hilo.daemon = True
-hilo.start()
+def signal(d):
+    rsi = d['rsi']
+    if rsi is None:
+        return 'Sin señal: historial insuficiente.'
+    if rsi < 40:
+        return 'Evaluar compra: RSI bajo; revisar caída, efectivo y concentración.'
+    if rsi > 70:
+        return 'Evaluar venta: RSI alto; comprobar ganancia neta y comisiones.'
+    return 'Esperar / mantener: RSI neutral; no justifica operar por sí solo.'
+
+
+def news(ticker):
+    if not FINNHUB:
+        return ''
+    now = datetime.now(NY)
+    try:
+        r = requests.get('https://finnhub.io/api/v1/company-news', params={
+            'symbol':ticker, 'from':(now-timedelta(days=3)).date().isoformat(),
+            'to':now.date().isoformat(), 'token':FINNHUB}, timeout=8)
+        r.raise_for_status()
+        items = r.json()
+        if not isinstance(items, list) or not items:
+            return 'Noticias: sin resultados recientes.'
+        n = max(items, key=lambda x:x.get('datetime', 0))
+        return f"Noticia ({n.get('source', 'Finnhub')}): {n.get('headline', '')[:220]}\n{n.get('url', '')}"
+    except Exception:
+        return 'Noticias: fuente no disponible.'
+
+
+def report():
+    now = datetime.now(NY)
+    lines = [f"REPORTE UNI — {now:%Y-%m-%d %H:%M} Nueva York",
+             'Mercado abierto' if is_open() else 'Mercado cerrado',
+             'Fuente: Yahoo Finance; datos pueden tener retraso.',
+             'RSI diario de Wilder, solo velas cerradas. Señales para evaluar, no órdenes.\n']
+    for t in TICKERS:
+        try:
+            d = market_data(t)
+            change = f"{d['change']:+.2f}%" if d['change'] is not None else 'sin dato'
+            rsi = f"{d['rsi']:.1f}" if d['rsi'] is not None else 'sin datos'
+            lines += [f"{t}: ${d['price']:.2f} | cambio vs cierre previo: {change}",
+                      f"Fecha vela precio: {d['date']} | RSI: {rsi} (cierre {d['rsi_date']})",
+                      signal(d), f'https://www.tradingview.com/symbols/{t}/']
+            n = news(t)
+            if n:
+                lines.append(n)
+            lines.append('')
+        except Exception:
+            lines.append(t + ': datos no disponibles; sin señal.\n')
+    return '\n'.join(lines)
+
+
+def portfolio_report():
+    cash, realized, fees, positions = portfolio(read_state())
+    quotes, missing = {}, []
+    for ticker in positions:
+        try:
+            quotes[ticker] = market_data(ticker)
+        except Exception:
+            missing.append(ticker)
+    total = cash + sum(positions[t]['qty']*d['price'] for t,d in quotes.items())
+    lines = [f'Efectivo registrado: ${cash:.2f}', f'Comisiones acumuladas: ${fees:.2f}',
+             f'Resultado realizado (comisiones incluidas): ${realized:.2f}']
+    if missing:
+        lines.append('Patrimonio incompleto; faltan precios: ' + ', '.join(missing))
+    else:
+        lines += [f'Patrimonio estimado: ${total:.2f}',
+                  f'Resultado total: ${total-INITIAL_CASH:+.2f} ({(total/INITIAL_CASH-1)*100:+.2f}%)']
+    for t,p in positions.items():
+        if t not in quotes:
+            continue
+        price = quotes[t]['price']
+        value = p['qty']*price
+        net_exit = value - COMMISSION - p['cost']
+        weight = value/total*100 if total > 0 and not missing else None
+        line = f"{t}: {p['qty']} acciones | precio ${price:.2f} | resultado si vendes todo ${net_exit:+.2f}"
+        if weight is not None:
+            line += f' | peso {weight:.1f}%'
+            if weight > 35:
+                line += ' ⚠ concentración'
+        if price/(p['cost']/p['qty'])-1 <= -.08:
+            line += ' ⚠ revisar pérdida ≥8% (costo incluye comisión)'
+        lines.append(line)
+    lines.append('Solo incluye operaciones registradas aquí. Contrastar con MarketWatch. No resta futuras comisiones al patrimonio.')
+    return '\n'.join(lines)
+
+
+HELP = '''COMANDOS
+/reporte — precios, RSI y noticias
+/portafolio o /resumen — cartera registrada
+/compra TICKER CANTIDAD PRECIO [COMISION]
+/venta TICKER CANTIDAD PRECIO [COMISION]
+Ejemplo: /compra NVDA 4 231.23 20
+Registra solo operaciones YA EJECUTADAS; no compra ni vende en MarketWatch.
+Registrar el historial en orden cronológico, una sola vez.
+/operaciones — identificadores del registro
+/deshacer ID — elimina el último registro si coincide el ID
+/alerta TICKER PRECIO — alerta persistente de cruce
+/alertas — listar
+/limpiar_alertas — borrar alertas
+/ping o /estado — estado
+Decimales con punto. Comisión predeterminada: $20.'''
+
+
+def positive(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError('Usa un número positivo y finito')
+    return number
+
+
+def command(text):
+    parts = text.split()
+    if not parts:
+        return 'Envía /ayuda para ver los comandos.'
+    cmd = parts[0].split('@')[0].lower()
+    if cmd in ('/start', '/ayuda'):
+        return HELP
+    if cmd in ('/ping', '/estado'):
+        redis('PING')
+        return 'Bot activo. Redis disponible. Mercado ' + ('abierto.' if is_open() else 'cerrado.')
+    if cmd == '/reporte':
+        return report()
+    if cmd in ('/portafolio', '/resumen'):
+        return portfolio_report()
+    with LOCK:
+        state = read_state()
+        if cmd in ('/compra', '/venta'):
+            if len(parts) not in (4,5):
+                raise ValueError('Formato: /compra o /venta TICKER CANTIDAD PRECIO [COMISION]')
+            t = parts[1].upper()
+            if t not in TICKERS:
+                raise ValueError('Ticker no permitido')
+            q = int(parts[2])
+            price = positive(parts[3])
+            fee = float(parts[4]) if len(parts) == 5 else COMMISSION
+            if q <= 0 or not math.isfinite(fee) or fee < 0:
+                raise ValueError('Cantidad positiva y comisión no negativa')
+            cash, _, _, pos = portfolio(state)
+            if cmd == '/compra' and q*price+fee > cash+0.000001:
+                raise ValueError('Efectivo registrado insuficiente; revisa el historial')
+            if cmd == '/venta' and q > pos.get(t, {}).get('qty', 0):
+                raise ValueError('No tienes esa cantidad registrada')
+            uid = secrets.token_hex(4)
+            state['trades'].append({'id':uid, 'ticker':t, 'qty':q, 'price':price,
+                'fee':fee, 'side':'buy' if cmd == '/compra' else 'sell',
+                'registered_at':datetime.now(UTC).isoformat()})
+            write_state(state)
+            return f'Registro guardado: {uid}. No se envió ninguna orden a MarketWatch.'
+        if cmd == '/operaciones':
+            return '\n'.join(f"{t['id']} {t['side']} {t['ticker']} {t['qty']} @ {t['price']} comisión {t['fee']}" for t in state['trades']) or 'Sin operaciones.'
+        if cmd == '/deshacer':
+            if len(parts) != 2 or not state['trades'] or state['trades'][-1]['id'] != parts[1]:
+                raise ValueError('Usa /deshacer ID con el identificador de la ÚLTIMA operación')
+            state['trades'].pop()
+            write_state(state)
+            return 'Último registro eliminado.'
+        if cmd == '/alerta':
+            if len(parts) != 3 or parts[1].upper() not in TICKERS:
+                raise ValueError('Formato: /alerta TICKER PRECIO')
+            t, target = parts[1].upper(), positive(parts[2])
+            price = market_data(t)['price']
+            direction = 'suba' if target > price else 'caiga'
+            if any(a['ticker']==t and a['price']==target for a in state['alerts']):
+                return 'Esa alerta ya existe.'
+            state['alerts'].append({'id':secrets.token_hex(4),'ticker':t,'price':target,'direction':direction})
+            write_state(state)
+            return f'Alerta guardada: {t} cuando {direction} a ${target:.2f}. Se verifica en sesión bursátil.'
+        if cmd == '/alertas':
+            return '\n'.join(f"{a['ticker']} {a['direction']} a ${a['price']:.2f}" for a in state['alerts']) or 'Sin alertas.'
+        if cmd == '/limpiar_alertas':
+            state['alerts'] = []
+            write_state(state)
+            return 'Alertas eliminadas.'
+    return 'Comando no reconocido. Usa /ayuda.'
+
+
+@app.get('/')
+def home():
+    return jsonify(status='running', started_at=START.isoformat())
+
+
+def authorized(value, expected):
+    return bool(expected and value and secrets.compare_digest(value, expected))
+
+
+@app.post('/telegram')
+def telegram():
+    if not authorized(request.headers.get('X-Telegram-Bot-Api-Secret-Token', ''), SECRET):
+        return 'Forbidden', 403
+    data = request.get_json(silent=True) or {}
+    msg = data.get('message', {})
+    if str(msg.get('chat', {}).get('id', '')) != CHAT:
+        return 'OK', 200
+    update = data.get('update_id')
+    if update is None:
+        return 'Invalid update', 400
+    # Un solo proceso; serializa registros y evita reintentos duplicados.
+    with LOCK:
+        try:
+            marker = key('update:' + str(update))
+            if redis('GET', marker):
+                return 'OK', 200
+            try:
+                reply = command(msg.get('text', ''))
+            except (ValueError, TypeError):
+                reply = 'Datos inválidos o fondos/cantidad insuficientes. Revisa /ayuda y /operaciones.'
+            # Marca después de procesar: un reintento no registra otra operación.
+            redis('SET', marker, 'done', 'EX', 604800)
+        except Exception:
+            log.warning('No se pudo procesar la actualización; revisa configuración y almacenamiento.')
+            return 'Temporary failure', 503
+    try:
+        send(reply)
+    except Exception:
+        log.warning('Respuesta no entregada a Telegram; consultar registros con /operaciones.')
+    return 'OK', 200
+
+
+@app.post('/configurar-webhook')
+def configure_webhook():
+    if not authorized(request.headers.get('X-Admin-Secret', ''), ADMIN):
+        return 'Forbidden', 403
+    base = os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
+    if not base.startswith('https://') or not TOKEN or not SECRET or not CHAT:
+        return jsonify(error='Configura PUBLIC_BASE_URL, TELEGRAM_TOKEN, CHAT_ID y TELEGRAM_WEBHOOK_SECRET'), 400
+    try:
+        r = requests.post(f'https://api.telegram.org/bot{TOKEN}/setWebhook',
+            json={'url':base+'/telegram','secret_token':SECRET,'allowed_updates':['message']},timeout=15)
+        ok = r.status_code == 200 and r.json().get('ok', False)
+        return jsonify(ok=ok), 200 if ok else 502
+    except Exception:
+        return jsonify(ok=False), 502
+
+
+@app.post('/probar')
+def test_report():
+    if not authorized(request.headers.get('X-Admin-Secret', ''), ADMIN):
+        return 'Forbidden', 403
+    try:
+        send(report())
+        return jsonify(ok=True)
+    except Exception:
+        return jsonify(ok=False), 502
+
+
+def once(name, message_factory):
+    # Reserva corta; al fallar se libera. Evita repetir entre reinicios.
+    k = key('notice:'+name)
+    if redis('SET', k, 'sending', 'NX', 'EX', 300) is None:
+        return
+    try:
+        send(message_factory())
+        redis('SET', k, 'done', 'EX', 172800)
+    except Exception:
+        redis('DEL', k)
+        raise
+
+
+def tick():
+    now = datetime.now(UTC)
+    day = now.astimezone(NY).date().isoformat()
+    bounds = session(day)
+    if not bounds:
+        return
+    opening, closing = bounds
+    if opening-timedelta(minutes=5) <= now < opening:
+        once(day+':open', lambda:'Wall Street abre en menos de 5 minutos. Las órdenes pendientes no aseguran el último precio.')
+    if closing+timedelta(minutes=2) <= now < closing+timedelta(minutes=30):
+        once(day+':close', report)
+    if not opening <= now < closing:
+        return
+    with LOCK:
+        state = read_state()
+        for a in list(state['alerts']):
+            d = market_data(a['ticker'])
+            if d['date'] != day:
+                continue
+            hit = d['price'] >= a['price'] if a['direction']=='suba' else d['price'] <= a['price']
+            if hit:
+                send(f"Alerta {a['ticker']}: precio de referencia ${d['price']:.2f}; objetivo ${a['price']:.2f}. Yahoo Finance puede tener retraso.")
+                state['alerts'].remove(a)
+                write_state(state)
+    # Compara dos velas consecutivas YA CERRADAS; excluye gaps de apertura.
+    if now < opening+timedelta(minutes=15):
+        return
+    for t in TICKERS:
+        bars = yf.Ticker(t).history(period='1d', interval='5m', auto_adjust=True)
+        if bars.empty:
+            continue
+        bars = bars[[stamp.to_pydatetime().astimezone(UTC)+timedelta(minutes=5) <= now for stamp in bars.index]]
+        if len(bars) < 2 or str(bars.index[-1].date()) != day:
+            continue
+        if bars.index[-1]-bars.index[-2] != timedelta(minutes=5):
+            continue
+        change = (float(bars['Close'].iloc[-1])/float(bars['Close'].iloc[-2])-1)*100
+        if abs(change) >= 1.5:
+            stamp = bars.index[-1].isoformat()
+            once(t+':vol:'+stamp, lambda t=t,change=change,stamp=stamp:
+                 f'{t}: movimiento {change:+.2f}% entre cierres de velas de 5 minutos. Vela: {stamp}. No es señal automática de compra.')
+
+
+def monitor():
+    while True:
+        try:
+            tick()
+        except Exception:
+            log.warning('Ciclo de monitoreo falló; se reintentará. No se muestran credenciales en logs.')
+        time.sleep(60)
+
+
+# Obligatorio usar UN worker de Gunicorn; varios procesos duplicarían monitores.
+if os.getenv('ENABLE_MONITOR', 'false').lower() == 'true':
+    if not all((TOKEN, CHAT, REDIS_URL, REDIS_TOKEN)):
+        raise RuntimeError('Falta configurar Telegram o Redis para activar el monitor')
+    threading.Thread(target=monitor, daemon=True, name='market-monitor').start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')))
