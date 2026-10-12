@@ -1,11 +1,13 @@
 """Bot de seguimiento UNI. No ejecuta operaciones en MarketWatch.
-Python 3.11+. Configuración e instrucciones en LEEME.md.
+Python 3.11+. Versión sencilla; contiene credenciales privadas. No publicar.
 """
 import os
 import json
 import math
 import time
 import secrets
+import hashlib
+import copy
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -22,13 +24,13 @@ app = Flask(__name__)
 NY = ZoneInfo('America/New_York')
 UTC = ZoneInfo('UTC')
 TICKERS = ['NVDA', 'AVGO', 'AMD', 'ASML', 'AMAT', 'LRCX', 'INTC', 'CSCO', 'KLAC']
-TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-CHAT = os.getenv('CHAT_ID', '')
-SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
-ADMIN = os.getenv('ADMIN_SECRET', '')
-REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL', '').rstrip('/')
-REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '')
-FINNHUB = os.getenv('FINNHUB_API_KEY', '')
+TOKEN = '8638954699:AAFuVLUKhi12SIm6iomuZ8fvyBgbLz37g2o'  # Preferible regenerarlo si quedó expuesto.
+CHAT = '7371069482'
+SECRET = hashlib.sha256(('webhook:'+TOKEN).encode()).hexdigest()
+ADMIN = hashlib.sha256(('admin:'+TOKEN).encode()).hexdigest()
+# Versión sencilla: datos temporales; se pierden al reiniciar.
+MEMORY = {}
+FINNHUB = 'darfuk9r01qn6lvf6tdgdarfuk9r01qn6lvf6te0'
 COMMISSION = float(os.getenv('COMMISSION', '20'))
 INITIAL_CASH = float(os.getenv('INITIAL_CASH', '10000'))
 PREFIX = os.getenv('REDIS_PREFIX', 'uni-finanzas')
@@ -38,15 +40,28 @@ START = datetime.now(UTC)
 
 
 def redis(*cmd):
-    if not REDIS_URL or not REDIS_TOKEN:
-        raise RuntimeError('Configura Upstash: no se guardarán datos en memoria temporal.')
-    r = requests.post(REDIS_URL, json=list(cmd),
-                      headers={'Authorization': 'Bearer ' + REDIS_TOKEN}, timeout=12)
-    r.raise_for_status()
-    body = r.json()
-    if body.get('error'):
-        raise RuntimeError('Error de almacenamiento Redis')
-    return body.get('result')
+    # Adaptador en memoria: no necesita una cuenta Redis.
+    with LOCK:
+        operation = str(cmd[0]).upper()
+        if operation == 'PING':
+            return 'PONG'
+        name = cmd[1]
+        item = MEMORY.get(name)
+        if item and item[1] is not None and item[1] <= time.time():
+            MEMORY.pop(name, None)
+            item = None
+        if operation == 'GET':
+            return item[0] if item else None
+        if operation == 'DEL':
+            return 1 if MEMORY.pop(name, None) else 0
+        if operation == 'SET':
+            options = list(cmd[3:])
+            if 'NX' in options and item:
+                return None
+            expires = time.time()+int(options[options.index('EX')+1]) if 'EX' in options else None
+            MEMORY[name] = (cmd[2], expires)
+            return 'OK'
+        raise ValueError('Operación de almacenamiento no soportada')
 
 
 def key(name):
@@ -280,7 +295,7 @@ def command(text):
         return HELP
     if cmd in ('/ping', '/estado'):
         redis('PING')
-        return 'Bot activo. Redis disponible. Mercado ' + ('abierto.' if is_open() else 'cerrado.')
+        return 'Bot activo. Almacenamiento temporal. Mercado ' + ('abierto.' if is_open() else 'cerrado.')
     if cmd == '/reporte':
         return report()
     if cmd in ('/portafolio', '/resumen'):
@@ -383,9 +398,9 @@ def telegram():
 def configure_webhook():
     if not authorized(request.headers.get('X-Admin-Secret', ''), ADMIN):
         return 'Forbidden', 403
-    base = os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
+    base = os.getenv('PUBLIC_BASE_URL', os.getenv('RENDER_EXTERNAL_URL', '')).rstrip('/')
     if not base.startswith('https://') or not TOKEN or not SECRET or not CHAT:
-        return jsonify(error='Configura PUBLIC_BASE_URL, TELEGRAM_TOKEN, CHAT_ID y TELEGRAM_WEBHOOK_SECRET'), 400
+        return jsonify(error='Falta URL pública de Render o token/chat en el código'), 400
     try:
         r = requests.post(f'https://api.telegram.org/bot{TOKEN}/setWebhook',
             json={'url':base+'/telegram','secret_token':SECRET,'allowed_updates':['message']},timeout=15)
@@ -424,10 +439,17 @@ def tick():
     day = now.astimezone(NY).date().isoformat()
     bounds = session(day)
     if not bounds:
+        peru = now.astimezone(ZoneInfo('America/Lima'))
+        if peru.weekday() >= 5 and peru.hour == 18:
+            once(peru.date().isoformat()+':weekend', lambda:'REPORTE DE FIN DE SEMANA\n\n'+report())
         return
     opening, closing = bounds
     if opening-timedelta(minutes=5) <= now < opening:
         once(day+':open', lambda:'Wall Street abre en menos de 5 minutos. Las órdenes pendientes no aseguran el último precio.')
+    if opening <= now < opening+timedelta(minutes=15):
+        once(day+':opened', lambda:'Wall Street ya abrió.\n\n'+report())
+    if closing-timedelta(minutes=5) <= now < closing:
+        once(day+':closing', lambda:'Wall Street cierra en menos de cinco minutos.')
     if closing+timedelta(minutes=2) <= now < closing+timedelta(minutes=30):
         once(day+':close', report)
     if not opening <= now < closing:
@@ -471,11 +493,29 @@ def monitor():
         time.sleep(60)
 
 
-# Obligatorio usar UN worker de Gunicorn; varios procesos duplicarían monitores.
-if os.getenv('ENABLE_MONITOR', 'false').lower() == 'true':
-    if not all((TOKEN, CHAT, REDIS_URL, REDIS_TOKEN)):
-        raise RuntimeError('Falta configurar Telegram o Redis para activar el monitor')
-    threading.Thread(target=monitor, daemon=True, name='market-monitor').start()
+def setup_and_monitor():
+    base = os.getenv('PUBLIC_BASE_URL', os.getenv('RENDER_EXTERNAL_URL', '')).rstrip('/')
+    if base.startswith('https://') and TOKEN and CHAT:
+        for attempt in range(3):
+            try:
+                response = requests.post(f'https://api.telegram.org/bot{TOKEN}/setWebhook',
+                    json={'url':base+'/telegram', 'secret_token':SECRET,
+                          'allowed_updates':['message']}, timeout=15)
+                if response.status_code == 200 and response.json().get('ok'):
+                    log.info('Webhook conectado al servicio de Render.')
+                    break
+                log.warning('No se pudo registrar el webhook; comprueba el token.')
+            except Exception:
+                log.warning('Fallo de conexión al registrar webhook.')
+            time.sleep(10)
+    else:
+        log.warning('Falta URL pública; configura PUBLIC_BASE_URL con tu URL de Render.')
+    monitor()
+
+
+# Un worker, sin --preload. En Render se activa automáticamente.
+if os.getenv('ENABLE_MONITOR', 'true').lower() == 'true':
+    threading.Thread(target=setup_and_monitor, daemon=True, name='market-monitor').start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')))
