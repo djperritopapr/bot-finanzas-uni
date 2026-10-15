@@ -1,4 +1,4 @@
-"""Bot UNI v3 — Telegram y diagnóstico web. Python 3.11+.
+"""Bot UNI v3.1 — Telegram y diagnóstico web. Python 3.11+.
 Registra operaciones; NO envía órdenes a MarketWatch.
 Configuración anterior conservada. No publiques credenciales en un repositorio público.
 """
@@ -32,7 +32,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN") or '8638954699:AAFuVLUKhi12SIm6iomuZ8fvyBgbL
 CHAT = os.getenv("CHAT_ID") or '7371069482'
 FINNHUB = os.getenv("FINNHUB_API_KEY") or 'darfuk9r01qn6lvf6tdgdarfuk9r01qn6lvf6te0'
 
-VERSION = '3.0'
+VERSION = '3.1'
 NY, PE = ZoneInfo('America/New_York'), ZoneInfo('America/Lima')
 UTC = timezone.utc
 COMMISSION = float(os.getenv('COMMISSION', '20'))
@@ -40,6 +40,7 @@ INITIAL_CASH = float(os.getenv('INITIAL_CASH', '10000'))
 MONITOR_ENABLED = os.getenv('ENABLE_MONITOR', 'true').lower() == 'true'
 VOLATILITY_PCT = float(os.getenv('VOLATILITY_PCT', '1.5'))
 DB_PATH = os.getenv('BOT_DB_PATH', '/tmp/uni_finanzas_v3.sqlite3')
+AUTO_BACKUP = os.getenv('AUTO_BACKUP', 'true').lower() == 'true'
 WEB_SECRET = hashlib.sha256(('webhook:'+TOKEN).encode()).hexdigest()
 ADMIN_SECRET = os.getenv('ADMIN_SECRET') or hashlib.sha256(('admin:'+TOKEN).encode()).hexdigest()
 BASE_URL = os.getenv('RENDER_EXTERNAL_URL') or os.getenv('PUBLIC_BASE_URL', '')
@@ -137,7 +138,14 @@ def mutation(action_id, change):
             if prev:
                 return json.loads(prev[0])
         state = json.loads(db.execute('SELECT data FROM state WHERE id=1').fetchone()[0])
+        before = json.dumps({k:state.get(k) for k in ('trades','alerts','interest')},sort_keys=True)
+        previous_revision = int(state.get('_revision',0))
         reply = change(state)
+        after = json.dumps({k:state.get(k) for k in ('trades','alerts','interest')},sort_keys=True)
+        if before!=after:
+            state['_revision'] = previous_revision+1
+            state['_backup_due'] = time.time()+180
+            state.setdefault('_install_id',uuid.uuid4().hex)
         db.execute('UPDATE state SET data=? WHERE id=1', (json.dumps(state, allow_nan=False),))
         if action_id:
             db.execute('INSERT INTO actions VALUES (?, ?)', (action_id, json.dumps(reply)))
@@ -233,6 +241,7 @@ class MarketData:
         self.cache = {}
         self.lock = threading.RLock()
         self.yahoo_lock = threading.Lock()
+        self.finnhub_lock = threading.Lock()
         self.yahoo_blocked = 0.0
         self.finnhub_blocked = 0.0
 
@@ -281,25 +290,34 @@ class MarketData:
     def finnhub_quote(self, ticker):
         if not FINNHUB or time.monotonic()<self.finnhub_blocked:
             return None
-        value = self.cached(('quote',ticker), 90)
-        if value is not None:
-            return value
-        try:
-            r = requests.get('https://finnhub.io/api/v1/quote',
-                params={'symbol':ticker,'token':FINNHUB}, timeout=6)
-            if r.status_code==429:
-                self.finnhub_blocked = time.monotonic()+300
+        with self.finnhub_lock:
+            if time.monotonic()<self.finnhub_blocked:
                 return None
-            r.raise_for_status()
-            data = r.json()
-            p, previous, stamp = float(data.get('c',0)), float(data.get('pc',0)), int(data.get('t',0))
-            if p<=0 or previous<=0 or not stamp or not all(math.isfinite(x) for x in (p,previous)):
+            value = self.cached(('quote',ticker),90)
+            if value is not None:
+                return value
+            if self.cached(('quote-failed',ticker),60):
                 return None
-            quote = {'price':p,'previous':previous,'change':(p/previous-1)*100,
-                     'stamp':datetime.fromtimestamp(stamp,UTC),'source':'Finnhub'}
-            return self.remember(('quote',ticker),quote)
-        except Exception:
-            return None
+            try:
+                r = requests.get('https://finnhub.io/api/v1/quote',
+                    params={'symbol':ticker,'token':FINNHUB},timeout=6)
+                if r.status_code in (401,403,429):
+                    self.finnhub_blocked = time.monotonic()+(3600 if r.status_code in (401,403) else 300)
+                    mark_status(last_error='Finnhub: clave rechazada' if r.status_code in (401,403) else 'Finnhub: límite de consultas')
+                    return None
+                r.raise_for_status()
+                data = r.json()
+                price,previous,stamp = float(data.get('c',0)),float(data.get('pc',0)),int(data.get('t',0))
+                if price<=0 or previous<=0 or not stamp or not all(math.isfinite(x) for x in (price,previous)):
+                    self.remember(('quote-failed',ticker),True)
+                    return None
+                quote = {'price':price,'previous':previous,'change':(price/previous-1)*100,
+                         'stamp':datetime.fromtimestamp(stamp,UTC),'source':'Finnhub'}
+                mark_status(last_source='Finnhub')
+                return self.remember(('quote',ticker),quote)
+            except Exception:
+                self.remember(('quote-failed',ticker),True)
+                return None
 
     def snapshot(self, ticker):
         now = now_utc()
@@ -493,13 +511,27 @@ def build_report(data, title='REPORTE DEL MERCADO'):
         lag = ' ⏳' if d['stale'] else ''
         lines.append(f"{icon} <b>{t}</b> {money(d['price'])} · {change} · RSI {rsi}{lag}")
     buy,sell = candidates(data)
-    lines += ['','🔎 <b>Para revisar</b>']
-    if buy:
-        lines.append('Entrada candidata: '+', '.join(buy)+'. Revisar tendencia, noticias y cartera.')
+    lines += ['','🔎 <b>Filtros cumplidos · para estudiar</b>']
+    state=read_state()
+    cash,_,_,pos=portfolio(state)
+    priced=all(data[t]['price'] is not None and not data[t]['stale'] for t in pos)
+    total=cash+sum(p['qty']*data[t]['price'] for t,p in pos.items()) if priced else None
+    for t in buy:
+        d=data[t]
+        reasons=[]
+        if d['rsi']<40:
+            reasons.append(f"RSI {d['rsi']:.1f} &lt; 40")
+        if d['drawdown'] is not None and d['drawdown']<=-8:
+            reasons.append(f"caída {d['drawdown']:.1f}% desde máximo de 20 cierres")
+        suffix=''
+        if total and t in pos and pos[t]['qty']*d['price']/total>.35:
+            suffix=' · ⚠️ ya supera el 35% de tu patrimonio'
+        lines.append(f"• <b>{t}</b>: "+'; '.join(reasons)+suffix)
     if sell:
         lines.append('RSI mayor de 70: '+', '.join(sell)+'. Revisar resultado neto antes de vender.')
     if not buy and not sell:
-        lines.append('Sin señales nuevas entre las acciones con datos vigentes.')
+        lines.append('Ninguna acción con datos vigentes cumple los filtros de revisión.')
+    lines.append('<i>Cumplir un filtro no confirma un rebote ni es una orden de compra.</i>')
     unavailable=[t for t,d in data.items() if d['price'] is None or d['stale'] or not usable_rsi(d)]
     if unavailable:
         lines.append('Sin evaluación completa: '+', '.join(unavailable)+'. Revisar datos antes de operar.')
@@ -508,14 +540,10 @@ def build_report(data, title='REPORTE DEL MERCADO'):
         worst = min(movers,key=lambda d:d['change'])
         if worst['change']<=-3:
             lines.append(f"Mayor caída: {worst['ticker']} ({worst['change']:+.2f}%). Caída no significa rebote seguro.")
-    if read_state()['trades']:
-        cash,_,_,pos = portfolio(read_state())
-        complete = all(data[t]['price'] is not None and not data[t]['stale'] for t in pos)
-        if complete:
-            total = cash+sum(p['qty']*data[t]['price'] for t,p in pos.items())
-            large = [t for t,p in pos.items() if total>0 and p['qty']*data[t]['price']/total>.35]
-            if large:
-                lines.append('⚠️ Más de 35% del patrimonio: '+', '.join(large)+'.')
+    if total and total>0:
+        large = [t for t,p in pos.items() if p['qty']*data[t]['price']/total>.35 and t not in buy]
+        if large:
+            lines.append('⚠️ Más de 35% del patrimonio: '+', '.join(large)+'.')
     dates = sorted({str(d['rsi_date']) for d in data.values() if usable_rsi(d)})
     sources = ', '.join(sorted({d['source'] for d in data.values() if d['price'] is not None}))
     lines += ['',f'<i>RSI Wilder 14 · cierre {esc(", ".join(dates) or "no disponible")}.</i>',
@@ -740,6 +768,7 @@ Comisión opcional; por defecto $20. Usa punto decimal.
 
 <b>Copias y diagnóstico</b>
 /exportar — descarga una copia JSON de tu cartera
+/respaldo — estado de las copias automáticas
 /restaurar — autoriza importar una copia durante 5 minutos
 /estado o /ping — comprobar el bot
 
@@ -809,7 +838,14 @@ def system_message():
            f'Yahoo: '+('en pausa temporal por errores/límite' if time.monotonic()<MARKET.yahoo_blocked else 'sin bloqueo conocido')]
     if status['last_error']:
         lines.append('Última incidencia: '+esc(status['last_error']))
-    lines.append('🗄️ Registros locales. Guarda /exportar antes de actualizar.')
+    active=[t.name for t in THREADS if t.is_alive()]
+    monitor_ok='market-monitor' in active if os.getenv('BOT_TESTING')!='true' else MONITOR_ENABLED
+    lines += ['Monitor funcionando: '+('sí' if monitor_ok else 'no'),
+              'Última comprobación UTC: '+esc(state.get('_monitor_seen','ninguna')),
+              'Datos de mercado: '+('incompletos' if state.get('_data_health')=='limited' else 'revisar /reporte'),
+              'Almacenamiento: '+('disco temporal' if str(DB_PATH).startswith('/tmp/') else 'ruta personalizada; verifica que el disco sea persistente'),
+              'Última copia automática UTC: '+esc(state.get('_backup_sent_at','ninguna'))]
+    lines.append('🗄️ Recuperación: /exportar · /restaurar · /respaldo')
     return message('\n'.join(lines),MENU)
 
 
@@ -823,7 +859,7 @@ def handle_command(text,action_id=None):
         return message(HELP,KEYBOARD)
     if cmd=='/ping':
         return message('🏓 <b>Bot activo.</b> Telegram responde. Mercado '+('abierto.' if session_open() else 'cerrado.')+'\nConsulta /reporte para comprobar los datos.',MENU)
-    if cmd=='/estado':
+    if cmd in ('/estado','/diagnostico'):
         return system_message()
     if cmd=='/reporte':
         return report()
@@ -919,9 +955,11 @@ def handle_command(text,action_id=None):
         return mutation(action_id,delete)
     if cmd=='/exportar':
         state=read_state()
-        backup={'version':1,'initial_cash':INITIAL_CASH,'created_at':now_utc().isoformat(),
-                'trades':state['trades'],'alerts':state['alerts'],'interest':state.get('interest',0)}
+        backup=backup_data(state)
         return message('💾 <b>Copia de seguridad</b>\nGuarda el archivo JSON. Contiene tus registros, no tokens. Para recuperarlos: /restaurar y adjunta este archivo.',document=backup)
+    if cmd=='/respaldo':
+        state=read_state()
+        return message('💾 <b>RESPALDO DE LA CARTERA</b>\nCopias automáticas: '+('activadas' if AUTO_BACKUP else 'desactivadas')+'\nÚltima copia automática entregada: '+esc(state.get('_backup_sent_at','ninguna'))+'\nExportar ahora: /exportar · recuperar copia: /restaurar.')
     if cmd=='/restaurar':
         def authorize_restore(state):
             state['restore_until']=time.time()+300
@@ -964,6 +1002,8 @@ def process_payload(payload,action_id):
         return handle_command(payload.get('text',''),action_id)
     if kind=='document':
         return restore_document(payload['document'],action_id)
+    if kind=='backup':
+        return message('💾 <b>COPIA AUTOMÁTICA DE TU CARTERA</b>\n'+esc(payload['backup']['created_at'])+' UTC\nGuarda este JSON. Si Render pierde los registros: /restaurar y adjunta el archivo. No contiene tokens.',document=payload['backup'])
     if kind=='report':
         return report(payload.get('title','REPORTE DEL MERCADO'))
     if kind=='weekend':
@@ -997,6 +1037,8 @@ def job_loop():
             try:
                 deliver(reply)
                 payload=json.loads(job['payload'])
+                if payload.get('kind')=='backup':
+                    ack_backup(payload,job['id'])
                 if payload.get('alert_id'):
                     mutation('ack:'+job['id'],lambda state:remove_triggered_alert(state,payload['alert_id']))
                 with connection() as db:
@@ -1075,6 +1117,97 @@ def check_volatility(now,opening):
             log.warning('No se pudo evaluar volatilidad de %s (%s).',ticker,type(exc).__name__)
 
 
+def backup_data(state=None):
+    state=state or read_state()
+    return {'version':1,'initial_cash':INITIAL_CASH,'created_at':now_utc().isoformat(),
+            'trades':state['trades'],'alerts':state['alerts'],'interest':state.get('interest',0)}
+
+
+def backup_job(job_id,state=None):
+    state=state or read_state()
+    revision=int(state.get('_revision',0))
+    install=state.get('_install_id','initial')
+    return queue_job(job_id,{'kind':'backup','backup':backup_data(state),
+        'backup_revision':revision,'backup_install':install})
+
+
+def has_records(state):
+    return bool(state['trades'] or state['alerts'] or state.get('interest',0))
+
+
+def maybe_auto_backup():
+    if not AUTO_BACKUP:
+        return
+    state=read_state()
+    revision=int(state.get('_revision',0))
+    if (has_records(state) or revision>0) and revision>int(state.get('_backup_sent_revision',-1)) and state.get('_backup_due',0)<=time.time():
+        install=state.get('_install_id','initial')
+        backup_job(f'auto-backup:{install}:{revision}',state)
+
+
+def maybe_daily_backup(day):
+    if not AUTO_BACKUP:
+        return
+    state=read_state()
+    if not has_records(state):
+        return
+    revision=int(state.get('_revision',0))
+    install=state.get('_install_id','initial')
+    sent=state.get('_backup_sent_at')
+    if sent and int(state.get('_backup_sent_revision',-1))==revision:
+        try:
+            if datetime.fromisoformat(sent).astimezone(NY).date().isoformat()==day:
+                return
+        except (ValueError,TypeError):
+            pass
+    # Una copia de estos mismos registros en curso sirve como respaldo del cierre.
+    with connection() as db:
+        pending=db.execute("SELECT payload FROM jobs WHERE status IN ('pending','working')").fetchall()
+    for row in pending:
+        payload=json.loads(row['payload'])
+        if payload.get('kind')=='backup' and payload.get('backup_revision')==revision and payload.get('backup_install')==install:
+            return
+    backup_job('daily-backup:'+day,state)
+
+
+def ack_backup(payload,job_id):
+    def acknowledge(state):
+        if state.get('_install_id','initial')==payload['backup_install']:
+            state['_backup_sent_revision']=max(int(state.get('_backup_sent_revision',-1)),payload['backup_revision'])
+            state['_backup_sent_at']=now_utc().isoformat()
+        return {'ok':True}
+    mutation('backup-ack:'+job_id,acknowledge)
+
+
+def monitor_heartbeat(now):
+    previous=read_state().get('_monitor_seen')
+    if previous:
+        try:
+            earlier=datetime.fromisoformat(previous)
+            minutes=(now-earlier).total_seconds()/60
+            bounds=trading_day(now.astimezone(NY).date().isoformat())
+            if minutes>3 and bounds and max(earlier,bounds[0])<min(now,bounds[1]):
+                queue_job('monitor-gap:'+now.strftime('%Y%m%d%H'),{'kind':'notification','text':
+                    f'⚠️ <b>PAUSA EN EL MONITOREO</b>\nHubo {minutes:.0f} minutos entre comprobaciones. Pueden faltar cruces de precio o movimientos.\nEl monitoreo se reanudó; revisa /estado.'})
+        except (ValueError,TypeError):
+            pass
+    mutation(None,lambda state:state.update({'_monitor_seen':now.isoformat()}) or {'ok':True})
+
+
+def data_health(data):
+    missing=[t for t,d in data.items() if d['price'] is None or d['stale'] or not usable_rsi(d)]
+    current='limited' if len(missing)>=3 else 'ok'
+    previous=read_state().get('_data_health')
+    if previous!=current:
+        if current=='limited':
+            queue_job('data-limited:'+now_utc().strftime('%Y%m%d%H'),{'kind':'notification','text':
+                '⚠️ <b>DATOS INCOMPLETOS</b>\nNo hay precio/RSI vigentes para: '+', '.join(missing)+'.\nEl bot responde, pero no puede evaluar esas acciones. Comprueba precios en MarketWatch.'})
+        elif previous=='limited':
+            queue_job('data-recovered:'+now_utc().strftime('%Y%m%d%H'),{'kind':'notification','text':
+                '✅ <b>DATOS RECUPERADOS</b>\nLa mayoría de las acciones vuelve a tener precio y RSI vigentes. Revisa las horas de cada fuente con /accion.'})
+        mutation(None,lambda state:state.update({'_data_health':current}) or {'ok':True})
+
+
 LAST_POLL = 0.0
 LAST_CLEANUP = 0.0
 
@@ -1084,6 +1217,8 @@ def tick():
     now=now_utc();day=now.astimezone(NY).date().isoformat()
     bounds=trading_day(day)
     mark_status(last_cycle=now.isoformat())
+    monitor_heartbeat(now)
+    maybe_auto_backup()
     if time.monotonic()-LAST_CLEANUP>3600:
         cleanup();LAST_CLEANUP=time.monotonic()
     if not bounds:
@@ -1102,10 +1237,12 @@ def tick():
             f'🔔 <b>WALL STREET CIERRA PRONTO</b>\nCierre: {closing.astimezone(PE):%H:%M} Perú.\nEl reporte de cierre se prepara diez minutos después.'})
     if closing+timedelta(minutes=10)<=now<closing+timedelta(minutes=90):
         queue_job('closing:'+day,{'kind':'report','title':'CIERRE DEL MERCADO'})
+        maybe_daily_backup(day)
     if not opening<=now<closing or time.monotonic()-LAST_POLL<300:
         return
     LAST_POLL=time.monotonic()
     data=snapshot_batch(TICKERS)
+    data_health(data)
     check_price_alerts(data)
     check_daily_moves(data,day)
     check_volatility(now,opening)
@@ -1134,7 +1271,7 @@ def register_webhook():
             ('portafolio','Tu cartera registrada'),('noticias','Titulares y fuentes'),
             ('alertas','Alertas guardadas'),('compra','Registrar una compra ejecutada'),
             ('venta','Registrar una venta ejecutada'),('exportar','Copia de seguridad'),
-            ('estado','Diagnóstico'),('ayuda','Todos los comandos')]]
+            ('estado','Diagnóstico'),('respaldo','Estado de las copias'),('ayuda','Todos los comandos')]]
         telegram_call('setMyCommands',{'commands':commands})
         mark_status(webhook='conectado')
         log.info('Webhook y menú conectados a Render. Bot v%s.',VERSION)
@@ -1148,6 +1285,10 @@ def register_webhook():
 def bootstrap():
     for _ in range(3):
         if register_webhook():
+            state=read_state()
+            recovery='Registros locales disponibles: '+str(len(state['trades']))+' operaciones.' if has_records(state) else 'No hay cartera registrada. Si ya tenías registros, recupera tu JSON con /restaurar.'
+            queue_job('startup:'+VERSION+':'+STARTED.isoformat(),{'kind':'notification','text':
+                '✅ <b>BOT UNI '+VERSION+' CONECTADO</b>\n'+recovery+'\nComprueba /ping, /estado y /respaldo. Envía /start para mostrar el menú.'})
             return
         if STOP.wait(20):
             return
@@ -1189,7 +1330,9 @@ def health():
     with STATUS_LOCK:
         status=dict(STATUS)
     return jsonify(status='running',version=VERSION,uptime_seconds=int((now_utc()-STARTED).total_seconds()),
-                   webhook=status['webhook'],monitor_enabled=MONITOR_ENABLED)
+                   webhook=status['webhook'],monitor_enabled=MONITOR_ENABLED,
+                   monitor_alive=any(t.name=='market-monitor' and t.is_alive() for t in THREADS),
+                   last_check=status['last_cycle'])
 
 
 @app.route('/',methods=['GET','HEAD'])
@@ -1200,6 +1343,9 @@ def home():
     error=esc(state['last_error'] or 'Sin incidencias registradas')
     last=esc(state['last_report'] or 'Todavía no se generó un reporte')
     webhook_state=esc(state['webhook'])
+    monitor_alive=any(t.name=='market-monitor' and t.is_alive() for t in THREADS)
+    monitor_state='Funcionando' if monitor_alive else ('Desactivado' if not MONITOR_ENABLED else 'Sin actividad confirmada')
+    last_cycle=esc(state['last_cycle'] or 'Todavía no se comprobó el mercado')
     # Pantalla pública de diagnóstico; no expone cartera, chat, tokens ni contenido de noticias.
     return f'''<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bot UNI · Estado</title><style>
@@ -1208,9 +1354,9 @@ small{{color:#64748b}}h1{{font-size:34px;margin:12px 0}}.badge{{display:inline-b
 .grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}}.card{{background:white;border-radius:16px;padding:20px;border:1px solid #e3e8f0}}.card b{{display:block;margin-top:8px;overflow-wrap:anywhere}}
 .note{{background:#e8edff;border-radius:16px;padding:20px;line-height:1.6}}code{{background:white;padding:3px 7px;border-radius:6px}}@media(max-width:500px){{.grid{{grid-template-columns:1fr}}h1{{font-size:28px}}}}
 </style><main><span class="badge">Servicio activo · v{VERSION}</span><h1>Tu bot de finanzas UNI</h1><small>Precios, alertas y registros desde Telegram.</small>
-<div class="grid"><div class="card"><small>Conexión Telegram</small><b>{webhook_state}</b></div><div class="card"><small>Monitor</small><b>{'Activado' if MONITOR_ENABLED else 'Desactivado'}</b></div>
+<div class="grid"><div class="card"><small>Conexión Telegram</small><b>{webhook_state}</b></div><div class="card"><small>Monitor</small><b>{monitor_state}</b><small>Última comprobación UTC: {last_cycle}</small></div>
 <div class="card"><small>Último reporte UTC</small><b>{last}</b></div><div class="card"><small>Última incidencia</small><b>{error}</b></div></div>
-<div class="note">Abre tu bot en Telegram y envía <code>/start</code> para mostrar los botones.<br>Comprueba <code>/ping</code>, consulta <code>/reporte</code> y guarda tu cartera con <code>/exportar</code>.<br><small>Este panel no confirma que los precios estén disponibles. Los servicios gratuitos pueden suspenderse.</small></div></main></html>'''
+<div class="note">Abre tu bot en Telegram y envía <code>/start</code> para mostrar los botones.<br>Comprueba <code>/ping</code>, consulta <code>/reporte</code> y revisa tus copias con <code>/respaldo</code>.<br>Antes de actualizar, guarda tu cartera con <code>/exportar</code>.<br><small>Este panel no confirma que los precios estén disponibles. Los servicios gratuitos pueden suspenderse.</small></div></main></html>'''
 
 
 @app.post('/probar')
